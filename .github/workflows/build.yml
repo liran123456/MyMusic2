@@ -1,0 +1,37 @@
+name: Build iPhone app
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use newest Xcode
+        run: |
+          V=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sed 's#.*/Xcode_##; s#\.app$##' | grep -iv beta | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+          if [ -n "$V" ]; then sudo xcode-select -s "/Applications/Xcode_$V.app"; fi
+          xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Create Xcode project
+        run: xcodegen generate
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project MyMusic.xcodeproj -scheme MyMusic -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/MyMusic.app Payload/
+          zip -qr MyMusic.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyMusic-ipa-${{ matrix.runner }}
+          path: MyMusic.ipa
