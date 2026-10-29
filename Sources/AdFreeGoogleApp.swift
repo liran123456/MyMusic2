@@ -202,8 +202,52 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// מצב גילוי: שיר מהחיפוש ממשיך לשירים בסגנון שלו, גם מזמרים אחרים
+    var discoverOn: Bool { UserDefaults.standard.object(forKey: "discover") as? Bool ?? true }
+
+    /// לחיצה על שיר בתוצאות החיפוש
+    func playFromSearch(_ song: Song, list: [Song]) {
+        if discoverOn {
+            // מתחילים רק עם השיר הזה — את ההמשך בוחרות ההמלצות של יוטיוב (סגנון דומה, זמרים שונים)
+            player.setShuffle(false)
+            play(song, in: [song])
+        } else {
+            play(song, in: list)
+        }
+    }
+
     /// מוסיף לתור שירים דומים כשהוא עומד להיגמר
     func fillQueue(after song: Song) {
+        guard discoverOn, player.current?.id == song.id else { fillByArtist(song); return }
+        player.fetchRelated { [weak self] items in
+            guard let self else { return }
+            let picks = self.discoverPicks(items, current: song, limit: 6)
+            if picks.count >= 3 {
+                DebugLog.add("גילוי: \(picks.count) שירים בסגנון מיוטיוב")
+                self.player.enqueue(picks)
+            } else {
+                DebugLog.add("גילוי: לא נמצאו המלצות (\(items.count)) — מחפש לפי הזמר")
+                self.fillByArtist(song)
+            }
+        }
+    }
+
+    /// בוחר מההמלצות: מעט מאותו זמר, לא יותר משניים מכל זמר, ושירים שעוד לא שמעת קודם
+    func discoverPicks(_ items: [Song], current: Song, limit: Int) -> [Song] {
+        let mine = current.displayArtist.lowercased()
+        var perArtist: [String: Int] = [:]
+        var fresh: [Song] = [], heard: [Song] = []
+        for s in items where s.id != current.id {
+            let a = s.displayArtist.lowercased()
+            let n = perArtist[a] ?? 0
+            if (a == mine) ? (n >= 1) : (n >= 2) { continue }
+            perArtist[a] = n + 1
+            if library.playCounts[s.id] == nil { fresh.append(s) } else { heard.append(s) }
+        }
+        return Array((fresh + heard).prefix(limit))
+    }
+
+    private func fillByArtist(_ song: Song) {
         let artist = song.displayArtist
         let q = artist.isEmpty ? song.displayTitle : artist
         guard !q.isEmpty, q != "טוען…" else { player.enqueue([]); return }
@@ -220,12 +264,24 @@ final class AppState: ObservableObject {
         let q = song.displayArtist.isEmpty ? song.displayTitle : song.displayArtist
         guard !song.title.isEmpty, !q.isEmpty else { showToast("עוד לא ידוע מה מתנגן"); return }
         showToast("מחפש שירים דומים…")
-        radio.onResults = { [weak self] items in
+        let byArtist = { [weak self] in
             guard let self else { return }
-            let added = self.player.enqueue(items.map { $0.song })
-            self.showToast(added > 0 ? "נוספו \(added) שירים לתור" : "לא נמצאו שירים דומים")
+            self.radio.onResults = { [weak self] items in
+                guard let self else { return }
+                let added = self.player.enqueue(items.map { $0.song })
+                self.showToast(added > 0 ? "נוספו \(added) שירים לתור" : "לא נמצאו שירים דומים")
+            }
+            self.radio.run(q)
         }
-        radio.run(q)
+        guard player.current?.id == song.id else { byArtist(); return }
+        player.fetchRelated { [weak self] items in
+            guard let self else { return }
+            let picks = self.discoverPicks(items, current: song, limit: 10)
+            if picks.count >= 3 {
+                let added = self.player.enqueue(picks)
+                self.showToast("נוספו \(added) שירים בסגנון")
+            } else { byArtist() }
+        }
     }
 
     func showToast(_ text: String) {
@@ -1240,7 +1296,7 @@ struct SearchTab: View {
             ForEach(searcher.results) { item in
                 SongRow(song: item.song, library: library, player: player,
                         subtitle: [item.song.displayArtist, item.length].filter { !$0.isEmpty }.joined(separator: " · "),
-                        action: { app.play(item.song, in: songs) })
+                        action: { app.playFromSearch(item.song, list: songs) })
             }
         }
     }
@@ -2082,7 +2138,7 @@ struct SettingsView: View {
     @ObservedObject var player: PlayerModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage("accent") private var accent = Theme.pink.rawValue
-    @AppStorage("showVideo") private var showVideo = true
+    @AppStorage("discover") private var discover = true
     @State private var confirm: String?
     @State private var backupURL: URL?
     @State private var importing = false
@@ -2130,9 +2186,11 @@ struct SettingsView: View {
                 }
                 Section("נגן") {
                     Toggle("מעבר מהיר בין שירים", isOn: $player.earlyStart)
+                    Toggle("גילוי: שיר מהחיפוש ממשיך לשירים בסגנון, גם מזמרים אחרים", isOn: $discover)
                     Toggle("להמשיך עם שירים דומים כשהתור נגמר", isOn: Binding(get: { player.autoContinue },
                                                                             set: { player.autoContinue = $0 }))
-                    Toggle("להציג וידאו בנגן", isOn: $showVideo)
+                    Toggle("וידאו (כבוי = שמע בלבד, עובד גם כשהאייפון נעול)", isOn: Binding(get: { player.videoOn },
+                                                                                       set: { player.setVideo($0) }))
                     Toggle("המשך לנגן ברקע (חלון צף)", isOn: Binding(get: { player.backgroundPiP },
                                                                      set: { player.backgroundPiP = $0 }))
                     Toggle("ברכב: להשאיר את המסך דלוק", isOn: Binding(get: { player.keepAwakeInCar },
@@ -2153,7 +2211,7 @@ struct SettingsView: View {
                     Text("אם משהו לא עובד, היכנס ליומן, לחץ \"העתק\" ושלח לי.")
                 }
                 Section {
-                    HStack { Text("גרסה"); Spacer(); Text("10.4").foregroundStyle(.secondary) }
+                    HStack { Text("גרסה"); Spacer(); Text("10.8").foregroundStyle(.secondary) }
                 }
             }
             .navigationTitle("הגדרות")
@@ -2355,7 +2413,6 @@ struct PlayerOverlay: View {
     @EnvironmentObject var app: AppState
     @ObservedObject var player: PlayerModel
     @ObservedObject var library: Library
-    @AppStorage("showVideo") private var showVideo = true
     @State private var scrubbing = false
     @State private var scrub = 0.0
     @State private var showQueue = false
@@ -2363,7 +2420,7 @@ struct PlayerOverlay: View {
     var body: some View {
         GeometryReader { geo in
             let expanded = player.expanded
-            let record = expanded && !showVideo
+            let record = expanded && (!player.videoOn || player.audioOnlyNow)
             // במצב תקליט התמונה מרובעת — מקטינים אותה כשהמילים פתוחות, כדי שהכל ייכנס במסך
             let artMax = geo.size.height * (player.showLyrics ? 0.30 : 0.40)
             let videoW = expanded ? (record ? min(geo.size.width - 48, artMax) : geo.size.width - 48) : 64
@@ -2382,6 +2439,7 @@ struct PlayerOverlay: View {
                         PlayerWebHost(a: player.webA, b: player.webB, active: player.webView)
                             .frame(width: videoW, height: videoW * 9 / 16)
                         if record { recordArt.frame(width: videoW, height: videoW) }
+                        else if player.audioOnlyNow || !player.videoOn { recordArt.frame(width: videoW, height: videoW * 9 / 16) }
                     }
                     .frame(width: videoW, height: boxH)
                     .clipShape(RoundedRectangle(cornerRadius: expanded ? (record ? 26 : 18) : 8))
@@ -2494,9 +2552,9 @@ struct PlayerOverlay: View {
                     .liquidGlass(in: Circle(), interactive: true)
             }
             Button {
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) { showVideo.toggle() }
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) { player.setVideo(!player.videoOn) }
             } label: {
-                Image(systemName: showVideo ? "opticaldisc" : "play.rectangle").font(.headline)
+                Image(systemName: player.videoOn ? "opticaldisc" : "play.rectangle").font(.headline)
                     .frame(width: 42, height: 42)
                     .liquidGlass(in: Circle(), interactive: true)
             }
@@ -2853,6 +2911,31 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     let webA: WKWebView
     let webB: WKWebView
     @Published private(set) var webView: WKWebView          // הנגן שמתנגן עכשיו
+    /// השיר הנוכחי התחיל כשהאייפון היה נעול, ולכן מתנגן כשמע בלבד (בלי וידאו) עד שייגמר
+    @Published private(set) var audioOnlyNow = false
+    /// וידאו כבוי כברירת מחדל: השירים מתנגנים כשמע בלבד (חוסך סוללה ואינטרנט, ועובד גם כשהאייפון נעול)
+    @Published private(set) var videoOn = UserDefaults.standard.bool(forKey: "videoOn")
+
+    /// כפתור הווידאו בנגן: מדליק או מכבה את הווידאו
+    func setVideo(_ on: Bool) {
+        guard on != videoOn else { return }
+        videoOn = on
+        UserDefaults.standard.set(on, forKey: "videoOn")
+        DebugLog.add(on ? "וידאו: הודלק" : "וידאו: כובה (שמע בלבד)")
+        // השיר הבא שכבר הוכן — מכינים אותו מחדש במצב החדש
+        standbyID = nil; standbyReady = false
+        preloadNext()
+        // הדלקת וידאו באמצע שיר שמתנגן כשמע: טוענים אותו מחדש עם וידאו מאותה שנייה
+        if on, audioOnlyNow, !inBackground, !sampleMode, ready, let s = current {
+            let keepPlaying = wantsPlay
+            pendingSeek = keepPlaying && time > 2 ? time : nil
+            if !keepPlaying { restoring = true; resumeAt = time }
+            ignoreRemotePauseUntil = Date().addingTimeInterval(3)
+            audioOnlyNow = false
+            armWatchdog(for: s.id)
+            webView.load(URLRequest(url: URL(string: "https://m.youtube.com/watch?v=\(s.id)" + (keepPlaying ? "" : "&restore=1"))!))
+        }
+    }
     private var standby: WKWebView { webView === webA ? webB : webA }   // מכין את השיר הבא
     @Published private(set) var sampleMode = false
     // מילים
@@ -2873,6 +2956,8 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         return min(max((time - sampleStart) / 30, 0), 1)
     }
     private var standbyID: String?
+    /// אחרי שאנחנו עצמנו מחליפים דף, iOS שולח לפעמים "pause" אוטומטי — מתעלמים ממנו
+    private var ignoreRemotePauseUntil = Date.distantPast
     private var standbyReady = false
     private var didEarly = false
     private var endHandled = false
@@ -3111,7 +3196,8 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         wantsPlay = false
         loadArtwork(for: s.id)
         updateNowPlaying(force: true)
-        let url = URL(string: "https://m.youtube.com/watch?v=\(s.id)&restore=1")!
+        audioOnlyNow = !videoOn
+        let url = URL(string: "https://m.youtube.com/watch?v=\(s.id)&restore=1" + (videoOn ? "" : "&audio=1"))!
         if ready { webView.load(URLRequest(url: url)) } else { pending = url }
     }
 
@@ -3230,7 +3316,7 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         standbyID = id
         standbyReady = false
         // ברקע: השיר הבא נטען כשמע בלבד — כך iOS מרשה לו להתחיל גם כשהאייפון נעול
-        let warm = inBackground ? "&warm=1&audio=1" : ""
+        let warm = inBackground ? "&warm=1&audio=1" : (videoOn ? "" : "&audio=1")
         if inBackground { DebugLog.add("ברקע: מכין את השיר הבא") }
         if let url = URL(string: "https://m.youtube.com/watch?v=\(id)&standby=1" + warm) {
             standby.load(URLRequest(url: url))
@@ -3243,8 +3329,10 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         guard !inBackground || !pipActive else { return false }
         guard let n = nextIndex, n < queue.count, let sid = standbyID, sid == queue[n].id else { return false }
         let old = webView
+        ignoreRemotePauseUntil = Date().addingTimeInterval(2)
         old.evaluateJavaScript("window.__userPaused=true; document.querySelectorAll('video').forEach(v => v.pause())", completionHandler: nil)
         webView = standby
+        audioOnlyNow = webView.url?.absoluteString.contains("audio=1") ?? false
         standbyID = nil
         js("window.__standby=false; window.__keepWarm=false; window.__userPaused=false; var v=document.querySelector('video'); if(v){ v.muted=false; v.currentTime=0; var p=v.play(); if(p&&p.catch)p.catch(function(){}); }")
         index = n
@@ -3381,12 +3469,13 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         wantsPlay = true
         try? AVAudioSession.sharedInstance().setActive(true)
         let url = URL(string: "https://m.youtube.com/watch?v=\(s.id)")!
-        if inBackground && !pipActive && ready && !sampleMode {
-            // אייפון נעול: טוענים את השיר כשמע בלבד (iOS לא חוסם התחלה של שמע ברקע)
+        if !sampleMode && (!videoOn || (inBackground && !pipActive && ready)) {
+            // שמע בלבד: ברירת המחדל, וגם כשהאייפון נעול (iOS לא חוסם התחלה של שמע ברקע)
             let audioURL = URL(string: "https://m.youtube.com/watch?v=\(s.id)&audio=1")!
-            DebugLog.add("ברקע (נעול): טוען את השיר כשמע בלבד")
-            webView.load(URLRequest(url: audioURL))
-            startKeepAlive()
+            if inBackground { DebugLog.add("ברקע: טוען את השיר כשמע בלבד") }
+            audioOnlyNow = true
+            if ready { webView.load(URLRequest(url: audioURL)) } else { pending = audioURL }
+            if inBackground { startKeepAlive() }
         } else if inBackground && ready && webView.url != nil {
             // ברקע: מחליפים שיר בתוך אותו נגן, כדי שהחלון הצף והקול לא ייסגרו
             let js = "(function(){var mp=document.getElementById('movie_player');" +
@@ -3402,6 +3491,7 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
             }
             startKeepAlive()
         } else {
+            audioOnlyNow = false
             if ready { webView.load(URLRequest(url: url)) } else { pending = url }
             if inBackground { startKeepAlive() }
         }
@@ -3581,7 +3671,7 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
             DebugLog.add("יציאה מהאפליקציה: ממלא את התור מראש")
             onNeedMore?(s)
         }
-        guard wantsPlay, isPlaying, !sampleMode, !inAd, backgroundPiP else { return }
+        guard wantsPlay, isPlaying, !sampleMode, !inAd, backgroundPiP, !audioOnlyNow else { return }
         webView.evaluateJavaScript(PlayerModel.enterPiPJS) { [weak self] r, err in
             let result = (r as? String) ?? (err?.localizedDescription ?? "?")
             self?.pipActive = result == "ok"
@@ -3600,17 +3690,12 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     @objc private func appBecameActive() {
         endKeepAlive()
         pipActive = false
-        // שיר שנטען כשמע בלבד כשהאייפון היה נעול — מחזירים לו את התמונה מאותה שנייה
-        if let u = webView.url?.absoluteString, u.contains("audio=1"), let s = current, !sampleMode {
-            DebugLog.add("חזרה לאפליקציה: מחזיר וידאו לשיר")
-            let keepPlaying = wantsPlay
-            pendingSeek = time > 2 ? time : nil
-            if !keepPlaying { restoring = true; resumeAt = time; pendingSeek = nil }
-            armWatchdog(for: s.id)
-            webView.load(URLRequest(url: URL(string: "https://m.youtube.com/watch?v=\(s.id)" + (keepPlaying ? "" : "&restore=1"))!))
-        }
+        // שיר שהתחיל כשמע בלבד (האייפון היה נעול) ממשיך כך עד שייגמר — בלי לטעון מחדש,
+        // כי טעינה מחדש עוצרת את השיר. בנגן מוצגת תמונת השיר במקום הווידאו.
+        audioOnlyNow = webView.url?.absoluteString.contains("audio=1") ?? false
+        if audioOnlyNow { DebugLog.add("חזרה לאפליקציה: השיר ממשיך כשמע בלבד עד שייגמר") }
         // השיר הבא שהוכן כשמע בלבד — מכינים אותו מחדש עם וידאו
-        if let u = standby.url?.absoluteString, u.contains("audio=1") { standbyID = nil; standbyReady = false }
+        if videoOn, let u = standby.url?.absoluteString, u.contains("audio=1") { standbyID = nil; standbyReady = false }
         updateCarState()
         js("window.__appActive=true;")
         standby.evaluateJavaScript("window.__appActive=true; window.__keepWarm=false;", completionHandler: nil)
@@ -3619,6 +3704,79 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     }
 
     /// סקריפט שמחזיר את השיר לנגן ומדווח אם הוא מתנגן
+    /// ההמלצות של יוטיוב לשיר שמתנגן ("הבא בתור" בדף של השיר)
+    func fetchRelated(_ done: @escaping ([Song]) -> Void) {
+        webView.evaluateJavaScript(PlayerModel.relatedJS) { r, _ in
+            var songs: [Song] = []
+            if let str = r as? String, let data = str.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
+                for d in arr {
+                    guard let id = d["id"], let t = d["title"], !t.isEmpty,
+                          let a = d["artist"], !a.isEmpty else { continue }
+                    // רק שירים: לא קצרים מדי (Shorts) ולא ארוכים מדי (מיקסים של שעה)
+                    if let len = d["len"], !len.isEmpty {
+                        let secs = len.split(separator: ":").reduce(0) { $0 * 60 + (Int($1) ?? 0) }
+                        if secs < 90 || secs > 600 { continue }
+                    }
+                    songs.append(Song(id: id, title: t, artist: a))
+                }
+            }
+            DispatchQueue.main.async { done(songs) }
+        }
+    }
+
+    static let relatedJS = """
+    (function(){
+      var out = [], seen = {};
+      function txt(t) {
+        if (!t) return '';
+        if (typeof t === 'string') return t;
+        if (t.simpleText) return t.simpleText;
+        if (t.runs) return t.runs.map(function(r){ return r.text || ''; }).join('');
+        if (t.content) return String(t.content);
+        return '';
+      }
+      function add(id, title, by, len) {
+        if (!id || id.length !== 11 || seen[id] || !title) return;
+        seen[id] = 1;
+        out.push({ id: id, title: String(title).trim(), artist: String(by || '').trim(), len: String(len || '').trim() });
+      }
+      function walk(o, depth) {
+        if (!o || typeof o !== 'object' || depth > 45 || out.length >= 50) return;
+        if (Array.isArray(o)) { for (var i = 0; i < o.length; i++) walk(o[i], depth + 1); return; }
+        if (typeof o.videoId === 'string' && (o.headline || o.title) && (o.shortBylineText || o.longBylineText || o.ownerText)) {
+          add(o.videoId, txt(o.headline) || txt(o.title),
+              txt(o.shortBylineText) || txt(o.longBylineText) || txt(o.ownerText), txt(o.lengthText));
+          return;
+        }
+        for (var k in o) {
+          if (k === 'frameworkUpdates' || k === 'responseContext' || k === 'playerOverlays') continue;
+          walk(o[k], depth + 1);
+        }
+      }
+      try {
+        var data = window.ytInitialData;
+        if (typeof data === 'string') data = JSON.parse(data);
+        walk(data, 0);
+      } catch (e) {}
+      if (out.length < 3) {
+        try {
+          document.querySelectorAll('ytm-video-with-context-renderer, ytm-compact-video-renderer').forEach(function(el){
+            var a = el.querySelector('a[href*="watch?v="]');
+            if (!a) return;
+            var m = (a.getAttribute('href') || '').match(/v=([A-Za-z0-9_-]{11})/);
+            if (!m) return;
+            var h = el.querySelector('h3, h4, .media-item-headline');
+            var b = el.querySelector('.media-item-byline, .ytm-badge-and-byline-item-byline');
+            var l = el.querySelector('.badge-shape-wiz__text, ytm-thumbnail-overlay-time-status-renderer');
+            add(m[1], h ? h.textContent : '', b ? b.textContent : '', l ? l.textContent : '');
+          });
+        } catch (e) {}
+      }
+      return JSON.stringify(out);
+    })();
+    """
+
     static let resumeJS = """
     (function(){
       var v = document.querySelector('video');
@@ -3862,7 +4020,10 @@ final class PlayerModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
             switch r {
             case "next": remoteSkip(forward: true)
             case "prev": remoteSkip(forward: false)
-            case "pause": setPlaying(false)
+            case "pause":
+                if Date() < ignoreRemotePauseUntil {
+                    DebugLog.add("התעלמתי מעצירה אוטומטית של iOS (בזמן החלפת דף)")
+                } else { setPlaying(false) }
             case "play": setPlaying(true)
             default: break
             }
